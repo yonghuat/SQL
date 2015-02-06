@@ -1,2 +1,0 @@
-# SQL
-personal sql repo
