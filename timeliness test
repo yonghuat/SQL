@@ -1,0 +1,284 @@
+ALTER SESSION SET NLS_DATE_FORMAT='YYYY/MM/DD HH24:MI:SS';
+DROP TABLE  tmp_first_variant;
+
+CREATE GLOBAL TEMPORARY TABLE tmp_first_variant
+(
+  workflow_id NUMBER(38,0),
+  asin VARCHAR2(10 BYTE),
+  asset_id NUMBER(38,0), 
+  process_class VARCHAR2(100 BYTE),
+  studio VARCHAR2(80 BYTE), 
+  marketplace_id NUMBER(38,0), 
+  variant VARCHAR2(10 BYTE), 
+  retouch_requested_first DATE,
+  wd_retouch_requested_first NUMBER(1,0),
+  publication_pending_first DATE,
+  wd_publication_pending_first NUMBER(1,0),
+  published_first DATE,
+  wd_published_first NUMBER(1,0),
+  first_retouch DATE,
+  first_pub DATE
+)ON COMMIT PRESERVE ROWS;
+
+DROP TABLE tmp_timeliness;
+CREATE GLOBAL TEMPORARY TABLE tmp_timeliness
+(
+  YEAR_WEEK VARCHAR2(10 BYTE),
+  YEAR NUMBER(4,0),
+  QUARTER VARCHAR2(2 BYTE),
+  MONTH_NUM VARCHAR2(2 BYTE),
+  MONTH VARCHAR2(3 BYTE),
+  WEEK NUMBER(2,0),
+  SOURCE_TYPE VARCHAR2(20 BYTE),
+  SAMPLE_ID NUMBER(10,0),
+  ASSET_ID NUMBER(36,0),
+  REGION_NAME VARCHAR2(2 BYTE),
+  MARKETPLACE_ID NUMBER(38,0),
+  MARKETPLACE_NAME VARCHAR2(100 BYTE),
+  BUILDING_NAME VARCHAR2(10 BYTE),
+  STUDIO VARCHAR2(10 BYTE),
+  PRODUCT_FAMILY VARCHAR2(100 BYTE),
+  GL_ID NUMBER(38,0),
+  GL_NAME VARCHAR2(20 BYTE),
+  CATEGORY VARCHAR2(100 BYTE),
+  SUBCATEGORY VARCHAR2(100 BYTE),
+  PROCESS_CLASS_ROLL_UP VARCHAR2(100 BYTE),
+  PROCESS_CLASS_CLASS VARCHAR2(100 BYTE),
+  ASIN VARCHAR2(10 BYTE),
+  TRANSFER_REQUEST DATE,
+  P2_RECEIVED DATE,
+  RETOUCH_REQUESTED_FIRST DATE,
+  PUBLICATION_PENDING_FIRST DATE,
+  PUBLISHED_FIRST DATE,
+  STUDIO_CYCLE_TIME NUMBER(38,1),
+  RETOUCH_CYCLE_TIME NUMBER(38,1),
+  PUBLISH_CYCLE_TIME NUMBER(38,1),
+  NZ_IMAGING_CYCLE_TIME NUMBER(38,1),
+  ZAPPOS_IMAGING_CYCLE_TIME NUMBER(38,1),
+  IMAGING_CYCLE_TIME NUMBER(38,1),
+  SLA NUMBER(3,0),
+  SLA_FLAG NUMBER(1,0)
+)ON COMMIT PRESERVE ROWS;
+
+
+
+TRUNCATE TABLE tmp_first_variant;
+--create a temporary table that keep the workflow id n asset id  of the first variant shot by the studio for a particular marketplace 
+INSERT INTO tmp_first_variant
+SELECT * FROM
+(
+  SELECT assets.workflow_id, assets.asin, assets.asset_id, 
+  NVL(assets.actual_process_class,assets.process_class) AS process_class,
+  assets.studio, 
+  assets.marketplace_id, 
+  assets.variant, 
+  assets.retouch_requested_first,
+  TO_CHAR(assets.retouch_requested_first, 'D') wd_retouch_requested,
+  assets.publication_pending_first,
+  TO_CHAR(assets.publication_pending_first, 'D') wd_publication_pending,
+  assets.published_first,
+  TO_CHAR(assets.published_first, 'D') wd_published,
+  MIN(assets.retouch_requested_first) OVER (PARTITION BY assets.studio,assets.marketplace_id,assets.variant,assets.asin) AS first_retouch,
+  MIN(assets.published_first) OVER (PARTITION BY assets.studio,assets.marketplace_id,assets.variant,assets.asin) AS first_pub
+  --first pub of studio, marketplace, asin, variant 
+  FROM picture2_ddl.d_photo_studio_assets assets
+  WHERE assets.asset_type = 'IMAGE_ASSET'
+  AND 
+    (
+      ( --(IMAGING-STUDIO, IMAGING-STUDIO-FC) 
+          assets.source_type_id IN (5400,5405) 
+          AND assets.retouch_requested_first IS NOT NULL  --MUST HAVE retouch request
+          AND 
+          (  
+            --NOT Color Author for Zappos 
+            assets.marketplace_id=188630 AND color_author_item_type IS NULL
+          ) 
+          OR 
+          (  --IF NOT ZAPPOS, MUST HAVE PUBLICATION PENDING
+            assets.marketplace_id != 188630 AND assets.publication_pending_first IS NOT NULL 
+          )
+      )
+      OR 
+      ( -- IMAGING-COLOR-AUTHOR
+        assets.source_type_id  =5440
+        AND assets.marketplace_id NOT IN (78961, 78971, 78931, 188630) --NOT ZAPPOS, NOT BUYVIP
+        AND assets.color_author_item_type = 'CA_TARGET'
+      )   
+    )
+  AND (assets.marketplace_id != 188630 AND assets.publication_pending_first IS NOT NULL) --IF NOT ZAPPOS, MUST HAVE PUBLICATION PENDING
+  AND assets.erroneous IS NULL
+  AND (assets.problem IS NULL OR assets.problem < assets.published_first) 
+) first_variant_record
+WHERE 
+  ( --not zappos or BUYVIP and first published
+    published_first = first_pub AND marketplace_id NOT IN (78961, 78971, 78931, 188630)
+  )
+  OR
+  ( --zappos and first retouch
+    retouch_requested_first = first_retouch AND marketplace_id = 188630
+  )
+;
+
+TRUNCATE TABLE tmp_timeliness;
+INSERT INTO tmp_timeliness
+SELECT YEAR_WEEK,	YEAR,	QUARTER,	MONTH_NUM,	MONTH,	WEEK,	SOURCE_TYPE,	
+SAMPLE_ID,	ASSET_ID,	REGION_NAME,	MARKETPLACE_ID,	MARKETPLACE_NAME,	BUILDING_NAME,	
+STUDIO,	PRODUCT_FAMILY,	GL_ID,	GL_NAME,	CATEGORY,	SUBCATEGORY,	PROCESS_CLASS_ROLL_UP,	
+PROCESS_CLASS,	ASIN,	TRANSFER_REQUEST,	P2_RECEIVED,	RETOUCH_REQUESTED_FIRST,	
+PUBLICATION_PENDING_FIRST,	PUBLISHED_FIRST,	STUDIO_CYCLE_TIME,	RETOUCH_CYCLE_TIME,	
+PUBLISH_CYCLE_TIME,	nz_imaging_cycle_time,	zappos_imaging_cycle_time,
+NVL(nz_imaging_cycle_time,zappos_imaging_cycle_time) IMAGING_CYCLE_TIME, SLA, 
+CASE WHEN NVL(nz_imaging_cycle_time,zappos_imaging_cycle_time) < SLA THEN 1 ELSE 0 END  AS SLA_FLAG
+FROM
+(
+SELECT /*+ USE_HASH(assets, asins, so, pgr, opc, sla, cats, subcats,ord) */ 
+ord.reporting_year || '-' || lpad(ord.reporting_week_of_year,2,'0') AS year_week,
+TO_CHAR(DECODE(assets.marketplace_id, 188630, assets.retouch_requested_first,assets.published_first),'YYYY') AS year,
+'Q' || TO_CHAR(DECODE(assets.marketplace_id, 188630, assets.retouch_requested_first,assets.published_first),'Q') AS quarter,
+TO_CHAR(DECODE(assets.marketplace_id, 188630, assets.retouch_requested_first,assets.published_first),'MM') AS month_num,
+TO_CHAR(DECODE(assets.marketplace_id, 188630, assets.retouch_requested_first,assets.published_first),'MON') AS month,
+ord.reporting_week_of_year AS week,
+CASE 
+  WHEN asins.source_type LIKE 'IMAGING-STUDIO%'  THEN 'IMAGING-STUDIO' 
+END as source_type,
+asins.sample_id,
+assets.asset_id,
+DECODE(asins.region_name, 'FE','AP', asins.region_name) region_name,
+asins.marketplace_id,
+asins.marketplace_name,
+so.building_name,
+assets.studio,
+pgr.pg_rollup AS product_family,
+asins.gl_product_group_id AS gl_id,
+asins.gl_product_group_name AS gl_name,
+NVL(cats.description, asins.category) AS category,
+NVL(subcats.description, asins.subcategory) AS subcategory,
+opc.process_class_roll_up,
+assets.process_class,
+assets.asin,
+asins.transfer_request, 
+asins.received AS p2_received, -- received into p2
+assets.retouch_requested_first,--uploaded for retouch added 1/6/2014
+assets.publication_pending_first, -- submitted by retouch
+assets.published_first,
+CASE  WHEN assets.MARKETPLACE_ID = 188630  THEN NULL
+            WHEN  to_char(asins.received, 'D') IN (7,1) AND to_char(assets.retouch_requested_first, 'D') NOT IN (7,1)  -- start weekend, end weekday
+              THEN 
+                ROUND(assets.retouch_requested_first -trunc(next_day(asins.received, 'MONDAY'))  
+                 - ( (TRUNC(assets.retouch_requested_first,'D') - TRUNC(next_day(asins.received, 'MONDAY'),'D'))/7*2),2)
+            WHEN to_char(asins.received, 'D') NOT IN (7,1) AND to_char(assets.retouch_requested_first, 'D') IN (7,1)  -- start weekday, end weekend
+              THEN
+                ROUND(trunc(next_day(assets.retouch_requested_first -6, 'SATURDAY')) - asins.received 
+                - ((TRUNC(assets.retouch_requested_first,'IW') - TRUNC(asins.received,'IW'))/7 * 2),2)
+                -- day difference minus week difference (start monday) * 2 days
+            WHEN 
+                to_char(asins.received, 'D') IN (7,1) AND to_char(assets.retouch_requested_first, 'D') IN (7,1)  -- start weekend, end weekend
+              THEN
+                  ROUND(((TRUNC(assets.retouch_requested_first,'IW') - TRUNC(asins.received,'IW'))/7 * 5),2)--return weekdays in between two days
+              ELSE 
+                ROUND(assets.retouch_requested_first-asins.received -  ((TRUNC(assets.retouch_requested_first,'D')-  trunc(asins.received,'D'))/7*2),2) 
+          END AS studio_cycle_time
+,CASE 
+   WHEN assets.MARKETPLACE_ID = 188630  THEN NULL
+    WHEN  to_char(assets.retouch_requested_first, 'D') IN (7,1) AND to_char(assets.publication_pending_first, 'D') NOT IN (7,1)  -- start weekend, end weekday
+      THEN 
+      ROUND(assets.publication_pending_first -trunc(next_day(assets.retouch_requested_first, 'MONDAY'))  
+                 - ( (TRUNC(assets.publication_pending_first,'D') - TRUNC(next_day(assets.retouch_requested_first, 'MONDAY'),'D'))/7*2),2)
+    WHEN to_char(assets.retouch_requested_first, 'D') NOT IN (7,1) AND to_char(assets.publication_pending_first, 'D') IN (7,1)  -- start weekday, end weekend
+      THEN
+        ROUND(trunc(next_day(assets.publication_pending_first -6, 'SATURDAY')) - assets.retouch_requested_first 
+                - ((TRUNC(assets.publication_pending_first,'IW') - TRUNC(assets.retouch_requested_first,'IW'))/7 * 2),2)
+                -- day difference minus week difference (start monday) * 2 days
+    WHEN 
+      to_char(assets.retouch_requested_first, 'D') IN (7,1) AND to_char(assets.publication_pending_first, 'D') IN (7,1)  -- start weekend, end weekend
+      THEN
+          ROUND(((TRUNC(assets.publication_pending_first,'IW') - TRUNC(assets.retouch_requested_first,'IW'))/7 * 5),2)--return weekdays in between two days
+    ELSE 
+      ROUND(assets.publication_pending_first-assets.retouch_requested_first -  ((TRUNC(assets.publication_pending_first,'D')-  trunc(assets.retouch_requested_first,'D'))/7*2),2) 
+    END AS retouch_cycle_time
+, CASE  
+  WHEN assets.MARKETPLACE_ID = 188630  THEN NULL
+  WHEN  to_char(assets.publication_pending_first, 'D') IN (7,1) AND to_char(assets.published_first, 'D') NOT IN (7,1)  -- start weekend, end weekday
+    THEN 
+      ROUND(assets.published_first -trunc(next_day(assets.publication_pending_first, 'MONDAY'))  
+                 - ( (TRUNC(assets.published_first,'D') - TRUNC(next_day(assets.publication_pending_first, 'MONDAY'),'D'))/7*2),2)
+  WHEN to_char(assets.publication_pending_first, 'D') NOT IN (7,1) AND to_char(assets.published_first, 'D') IN (7,1)  -- start weekday, end weekend
+    THEN
+      ROUND(TRUNC(next_day(assets.published_first -6, 'SATURDAY')) - assets.publication_pending_first 
+                - ((TRUNC(assets.published_first,'IW') - TRUNC(assets.publication_pending_first,'IW'))/7 * 2),2) -- day difference minus week difference (start monday) * 2 days
+  WHEN to_char(assets.publication_pending_first, 'D') IN (7,1) AND to_char(assets.published_first, 'D') IN (7,1)  -- start weekend, end weekend
+    THEN
+    ROUND(((TRUNC(assets.published_first,'IW') - TRUNC(assets.publication_pending_first,'IW'))/7 * 5),2)--return weekdays in between two days
+  ELSE 
+    ROUND(assets.published_first-assets.publication_pending_first -  ((TRUNC(assets.published_first,'D')-  trunc(assets.publication_pending_first,'D'))/7*2),2) 
+  END  AS publish_cycle_time
+, CASE 
+  WHEN assets.MARKETPLACE_ID = 188630  THEN NULL
+  WHEN  to_char(asins.received, 'D') IN (7,1) AND to_char(assets.published_first, 'D') NOT IN (7,1)  -- start weekend, end weekday
+    THEN 
+      ROUND(assets.published_first -trunc(next_day(asins.received, 'MONDAY'))  
+       - ( (TRUNC(assets.published_first,'D') - TRUNC(next_day(asins.received, 'MONDAY'),'D'))/7*2),2)
+  WHEN to_char(asins.received, 'D') NOT IN (7,1) AND to_char(assets.published_first, 'D') IN (7,1)  -- start weekday, end weekend
+    THEN
+      ROUND(TRUNC(next_day(assets.published_first -6, 'SATURDAY')) - asins.received 
+        - ((TRUNC(assets.published_first,'IW') - TRUNC(asins.received,'IW'))/7 * 2),2)   -- day difference minus week difference (start monday) * 2 days
+   WHEN to_char(asins.received, 'D') IN (7,1) AND to_char(assets.published_first, 'D') IN (7,1)  -- start weekend, end weekend
+      THEN
+      ROUND(((TRUNC(assets.published_first,'IW') - TRUNC(asins.received,'IW'))/7 * 5),2)--return weekdays in between two days
+    ELSE 
+      ROUND(assets.published_first-asins.received -  ((TRUNC(assets.published_first,'D')-  trunc(asins.received,'D'))/7*2),2) 
+    END AS nz_imaging_cycle_time,
+CASE 
+  WHEN assets.MARKETPLACE_ID != 188630  THEN NULL
+  WHEN  to_char(asins.received, 'D') IN (7,1) AND to_char(assets.retouch_requested_first, 'D') NOT IN (7,1)  -- start weekend, end weekday
+    THEN 
+      ROUND(assets.retouch_requested_first -trunc(next_day(asins.received, 'MONDAY'))  
+       - ( (TRUNC(assets.retouch_requested_first,'D') - TRUNC(next_day(asins.received, 'MONDAY'),'D'))/7*2),2)
+  WHEN to_char(asins.received, 'D') NOT IN (7,1) AND to_char(assets.retouch_requested_first, 'D') IN (7,1)  -- start weekday, end weekend
+    THEN
+      ROUND(TRUNC(next_day(assets.retouch_requested_first -6, 'SATURDAY')) - asins.received 
+        - ((TRUNC(assets.retouch_requested_first,'IW') - TRUNC(asins.received,'IW'))/7 * 2),2)   -- day difference minus week difference (start monday) * 2 days
+   WHEN to_char(asins.received, 'D') IN (7,1) AND to_char(assets.retouch_requested_first, 'D') IN (7,1)  -- start weekend, end weekend
+      THEN
+      ROUND(((TRUNC(assets.retouch_requested_first,'IW') - TRUNC(asins.received,'IW'))/7 * 5),2)--return weekdays in between two days
+    ELSE 
+      ROUND(assets.retouch_requested_first-asins.received -  ((TRUNC(assets.retouch_requested_first,'D')-  trunc(asins.received,'D'))/7*2),2) 
+    END AS zappos_imaging_cycle_time,
+sla.sla
+FROM tmp_first_variant assets 
+JOIN picture2_ddl.d_photo_studio_asins asins 
+ON asins.workflow_id = assets.workflow_id 
+JOIN picture2_ddl.o_sources so 
+ON assets.studio = so.name
+JOIN BOOKER.pgrollups pgr ON pgr.product_group = asins.gl_product_group_id
+JOIN picture2_ddl.o_process_classes opc ON opc.process_class_name = assets.process_class
+LEFT JOIN picture2_ddl.process_class_sla_map_3 sla 
+  ON sla.product_family = pgr.pg_rollup
+  AND sla.pc_rollup = opc.process_class_roll_up
+LEFT JOIN d_mp_asin_cats cats on cats.marketplace_id = assets.marketplace_id 
+  and cats.product_category = asins.category 
+  and cats.gl_product_group = asins.gl_product_group_id
+LEFT JOIN d_mp_asin_subcats subcats on subcats.marketplace_id = asins.marketplace_id 
+  and subcats.product_category = asins.category 
+  and subcats.product_subcategory = asins.subcategory 
+  and subcats.gl_product_group = asins.gl_product_group_id 
+JOIN o_reporting_days ord ON TRUNC(DECODE(assets.marketplace_id, 188630, assets.retouch_requested_first,assets.published_first),'DD') = TRUNC(ord.calendar_day,'DD')
+WHERE 
+assets.variant IN ('MAIN','GLMR')
+AND
+asins.received IS NOT NULL
+AND
+(
+  --NOT  Buyvip.es  Buyvip.it Buyvip.de Buyvip.fr Zappos: published within query dates
+  trunc(assets.published_first) >= TO_DATE('20150101','YYYYMMDD') 
+  AND assets.MARKETPLACE_ID NOT IN (78961, 78971, 78931, 188630)
+)
+OR
+( --ZAPPOS: retouch request within query date 
+  trunc(assets.retouch_requested_first) >= TO_DATE('20150101','YYYYMMDD')
+  AND  assets.MARKETPLACE_ID = 188630 
+)
+) data;
+
+SELECT * FROM tmp_timeliness;
+
